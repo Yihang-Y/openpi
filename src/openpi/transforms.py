@@ -181,6 +181,130 @@ class Unnormalize(DataTransformFn):
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
+
+
+def to_hwc_uint8(arr):
+    arr = np.asarray(arr)
+
+    # 灰度→3通道
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)  # (H,W)->(H,W,3)
+
+    elif arr.ndim == 3:
+        H, W, C = arr.shape
+
+        # W C H -> H W C
+        if arr.shape[1] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            # 例如 (640,3,480)
+            arr = np.transpose(arr, (2, 0, 1))     # -> (H,W,C)
+
+        # C H W -> H W C
+        elif arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            arr = np.transpose(arr, (1, 2, 0))     # -> (H,W,C)
+
+        # 如果已经是 HWC 就不动
+        # 其它怪异情况可在这里加更多分支
+
+    elif arr.ndim == 4:
+        # N C H W -> N H W C
+        if arr.shape[1] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            arr = np.transpose(arr, (0, 2, 3, 1))
+
+    # dtype 统一为 uint8（若是 0..1 浮点则缩放）
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0 + 1e-6:
+            arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
+        else:
+            arr = arr.astype(np.uint8, copy=False)
+
+    return arr
+
+
+import numpy as np
+from typing import Dict as DataDict
+
+try:
+    import cv2
+    _HAS_CV2 = True
+except Exception:
+    from PIL import Image
+    _HAS_CV2 = False
+
+def _resize_exact(img_hwc_uint8: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    if _HAS_CV2:
+        return cv2.resize(img_hwc_uint8, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    # PIL fallback
+    pil = Image.fromarray(img_hwc_uint8)
+    pil = pil.resize((out_w, out_h), resample=Image.Resampling.BOX)
+    return np.asarray(pil)
+
+def _crop_with_pad(img: np.ndarray, top: int, left: int, crop_h: int, crop_w: int) -> np.ndarray:
+    """支持越界时自动pad（黑边），确保返回尺寸固定为 (crop_h, crop_w, C)。"""
+    H, W = img.shape[:2]
+    bottom = top + crop_h
+    right  = left + crop_w
+
+    # 计算需要的 pad（如果越界）
+    pad_top   = max(0, -top)
+    pad_left  = max(0, -left)
+    pad_bot   = max(0, bottom - H)
+    pad_right = max(0, right  - W)
+
+    # 有越界就pad到足够大再裁
+    if any(v > 0 for v in (pad_top, pad_left, pad_bot, pad_right)):
+        pad_vals = ((pad_top, pad_bot), (pad_left, pad_right)) + ((0, 0),) if img.ndim == 3 else ((0, 0),)
+        img = np.pad(img, pad_vals, mode="constant", constant_values=0)
+        top  += pad_top
+        left += pad_left
+
+    return img[top:top+crop_h, left:left+crop_w]
+
+def _center_crop(img: np.ndarray, crop_h: int, crop_w: int) -> np.ndarray:
+    H, W = img.shape[:2]
+    top  = (H - crop_h) // 2
+    left = (W - crop_w) // 2
+    return _crop_with_pad(img, top, left, crop_h, crop_w)
+
+def _bottom_left_crop(img: np.ndarray, crop_h: int, crop_w: int) -> np.ndarray:
+    H, W = img.shape[:2]
+    top  = H - crop_h         # 从底部开始
+    left = 0                  # 从左边开始
+    return _crop_with_pad(img, top, left, crop_h, crop_w)
+
+@dataclasses.dataclass(frozen=True)
+class MyResize(DataTransformFn):
+    height: int
+    width: int
+    # def __init__(self, height: int, width: int):
+    #     self.height = height   # 最终给模型/CLIP的输入高
+    #     self.width  = width    # 最终给模型/CLIP的输入宽
+    #     self.down_h = 240      # 先把 640x480 变成 320x240
+    #     self.down_w = 320
+
+    def __call__(self, data: DataDict) -> DataDict:
+        out_images = {}
+
+        for k, v in data["image"].items():
+            # 你的工具：把任意输入转成 HWC uint8
+            img = to_hwc_uint8(v)
+
+            # 先下采样到 320x240（AREA/BOX）
+            img = _resize_exact(img, 240, 320)
+
+            # 按 key 选择裁剪策略，裁到 (self.height, self.width)
+            if k in ("image_1", "image_2"):
+                img = _bottom_left_crop(img, self.height, self.width)
+            elif k == "image3":
+                img = _center_crop(img, self.height, self.width)
+            else:
+                img = _center_crop(img, self.height, self.width)
+
+            out_images[k] = img
+
+        data["image"] = out_images
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class ResizeImages(DataTransformFn):
     height: int
